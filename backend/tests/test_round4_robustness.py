@@ -5,7 +5,7 @@
 没有测试守着。此处补上可离线确定性验证的两条：
 
 - /api/parse 总期限（PARSE_TOTAL_TIMEOUT）：解析协程超期 → 504，而非无限挂起；
-- 连接超时（CONNECT_TIMEOUT，默认 5s）：get_client 必须把 connect 超时接进
+- 连接超时（CONNECT_TIMEOUT，默认 15s）：get_client 必须把 connect 超时接进
   httpx.Timeout（改掉 connect= 参数或用整段 timeout 覆盖时本用例变红）。
 
 ①清理循环与④抖音探活属事件循环/计时器级行为（探活窗口 60s），靠部署观察，
@@ -69,7 +69,7 @@ def test_get_client_wires_default_connect_timeout(monkeypatch):
 
     timeout = asyncio.run(_go())
     assert timeout.connect == main.DEFAULT_CONNECT_TIMEOUT, (
-        f"connect 超时应接线到 CONNECT_TIMEOUT（默认 5s），实际 {timeout.connect}；"
-        "删掉 connect= 或改回整段 timeout 会让死代理白等满 15s 才换线路"
+        f"connect 超时应接线到 CONNECT_TIMEOUT（默认 15s），实际 {timeout.connect}；"
+        "删掉 connect= 会让 CONNECT_TIMEOUT 失效（该常量 2026-10-16 由 5s 调回 15s）"
     )
     assert timeout.read == 15, "read/write 保持整体超时值"

@@ -545,11 +545,12 @@ def test_panda_cache_write_side_isolation(monkeypatch):
 
 # ---------- G. T3 补测：VERIFY_TLS / /health/detail ----------
 
-def test_verify_tls_default_on():
-    """默认值钉住：不设环境变量时 VERIFY_TLS=True（P0 安全修复的关键开关，
-    此前改回 False 测试也不会红）。"""
+def test_verify_tls_default_off():
+    """默认值钉住：不设环境变量时 VERIFY_TLS=False（2026-10-16 多平台实测修订：
+    海外代理池对 SOOP/Twitch 做 TLS 中间盒（自签证书），默认开启校验会让海外平台
+    全线证书报错；旧版即为默认关闭。需要校验时用 1 + INSECURE_TLS_HOSTS 豁免）。"""
     if "VERIFY_TLS" not in os.environ:
-        assert main.VERIFY_TLS is True
+        assert main.VERIFY_TLS is False
 
 
 def test_tls_verify_for_respects_flags(monkeypatch):

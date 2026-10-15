@@ -426,14 +426,18 @@ else:
 CLIENT_POOL: dict = {}
 CLIENT_LOCK = asyncio.Lock()
 DEFAULT_TIMEOUT = 15
-# 【P0安全】TLS 证书校验默认开启（原先默认关闭，等于对所有 https 上游/代理隧道全局不校验）。
-# - 个别站点/自签代理证书异常：用 INSECURE_TLS_HOSTS 按域名例外，不要全局关
-# - 旧行为兼容：VERIFY_TLS=0 可全局关闭（启动时告警，仅建议本地调试）
-VERIFY_TLS = os.getenv("VERIFY_TLS", "1") == "1"
+# 【TLS 校验·2026-10-16 多平台实测后修订】默认回到关闭（VERIFY_TLS 默认 0，恢复旧版行为）：
+# 海外代理池（美国家宽 socks5）对 SOOP/Twitch 域名做 TLS 中间盒（自签证书）——开启校验后
+# 7/8 台 SOOP、6/8 台 Twitch 直接 CERTIFICATE_VERIFY_FAILED，海外平台解析全线报错；
+# 国内池证书干净（60 次浸泡 verify=True 全 200，不受影响）。
+# - VERIFY_TLS=0：全局关闭（默认，启动时告警）；=1：全局开启
+# - 想开启校验必须同时豁免被中间盒的域名（否则海外全挂）：
+#   VERIFY_TLS=1 + INSECURE_TLS_HOSTS=sooplive.com,sooplive.net,sooplivecdn.com,twitch.tv,ttvnw.net,twitchsvc.net
+VERIFY_TLS = os.getenv("VERIFY_TLS", "0") == "1"
 INSECURE_TLS_HOSTS = [h.strip().lower() for h in os.getenv("INSECURE_TLS_HOSTS", "").split(",") if h.strip()]
 
 if not VERIFY_TLS:
-    logging.warning("[安全] VERIFY_TLS=0 已全局关闭 TLS 证书校验（易受中间人攻击），仅建议本地调试临时使用")
+    logging.warning("[安全] VERIFY_TLS=0：已关闭 TLS 证书校验（海外代理池含自签证书中间盒，属本项目预期配置；需校验时设 VERIFY_TLS=1 + INSECURE_TLS_HOSTS 豁免海外域名）")
 elif INSECURE_TLS_HOSTS:
     logging.warning(f"[安全] 以下域名例外不校验 TLS 证书: {INSECURE_TLS_HOSTS}")
 
@@ -449,9 +453,11 @@ def _tls_verify_for(url: str) -> bool:
 # 注意 httpx 的 http2=True 必须有 h2 包（requirements.txt 已显式声明，原先靠传递依赖带入）
 HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "1") == "1"
 
-# 【健壮性】connect 短超时：死代理/黑洞网络要吃满整个 timeout 才失败换下一个，
-# connect 单独收紧到 5s（env 可调），read/write 保持原值（慢平台大页面不误杀）
-DEFAULT_CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "5"))
+# 【connect 超时·2026-10-16 多平台实测后修订】默认回到 15s（旧版行为；env CONNECT_TIMEOUT 可调）。
+# 曾收紧到 5s 防止死代理拖时间，但实测表明：跨境部署到国内代理的连接时长有 1~15s 的毛刺，
+# 5s 会把「慢但活」的代理误判为死 → 全池扫荡 + 直连兜底 + 冷静期（180s）的连锁，
+# 表现为「打开直播间好久才播放 / 日志刷失败 / 有弹幕没画面」。read/write 仍用整体超时值。
+DEFAULT_CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "15"))
 
 async def get_client(proxy=None, timeout=None, verify: bool = True):
     if timeout is None:
@@ -548,8 +554,8 @@ async def get_fixed_proxy_list(proxy_pool):
 # （EXTERNAL_PROXY_URLS，海外平台）共用：外代池连不通（部署环境无外网代理时常态）
 # 会误让国内请求也直连优先（国内代理明明可用）；反之亦然。改为按池分桶。
 # 【健壮性】600s 太钝：池劣化（而非全死）场景下用户要 10 分钟才恢复代理试用；
-# 收紧到 180s（env 可调），期间单请求最多吃一次全池 connect 超时（connect 已
-# 收紧到 5s，代价可控）。
+# 收紧到 180s（env 可调），期间单请求最多吃一次全池扫荡的代价（connect 超时见
+# DEFAULT_CONNECT_TIMEOUT，默认 15s）。
 _PROXY_POOL_DEAD_UNTIL: dict[str, float] = {}
 _PROXY_POOL_DEAD_SECONDS = float(os.getenv("PROXY_POOL_DEAD_SECONDS", "180"))
 
