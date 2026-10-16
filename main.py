@@ -2046,11 +2046,6 @@ from browse_api import router as browse_router, configure_parser as _configure_b
 _configure_browse_parser(_parse_dispatch)
 app.include_router(browse_router)
 
-# 【2026-10-16】BROWSE_VIA_PROXY=1 时，国内平台浏览请求（推荐/分区/搜索）改走国内代理池：
-# 把解析链路的 request_with_retry 注入 browse_platforms.common（同一进程、同一连接池/冷静期/日志）
-from browse_platforms import common as _browse_common
-_browse_common.configure_pool_fetch(request_with_retry)
-
 # ==================== 弹幕代理 ====================
 
 def _reset_go_service_check(mark_unavailable: bool = False):
