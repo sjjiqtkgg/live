@@ -4,12 +4,10 @@
   ① _parse_dispatch —— https://douyin.com.evil.com/ 能混进 parse_douyin，
      而它对传入 URL 有两处裸抓取（DouyinLiveStream.fetch_web_stream_data /
      request_with_retry 直拉页面）→ SSRF；
-  ② api_proxy use_external —— 域名出现在路径/查询串也误切外代池；
-  ③ api_follows_batch 分池 —— 同款子串；
-  ④ api_proxy m3u8 分流（_is_foreign_stream / eff_referer 兜底）—— "twitch" in url。
-收口后统一为 hostname 全等/点分后缀匹配（PLATFORM_SITES + EXTERNAL_STREAM_DOMAINS），
+  ② api_follows_batch 分池 —— 同款子串。
+收口后统一为 hostname 全等/点分后缀匹配（PLATFORM_SITES + FOREIGN_ROOM_DOMAINS），
 本文件钉住：平台识别矩阵（含攻击形态）、分派路由与 400 拒绝、抖音 SSRF 收口的
-「零网络调用」、外代池/海外流判定、_browse_identity 回归。
+「零网络调用」、关注批量分池、_browse_identity 回归。
 
 运行：python -m pytest backend/tests/test_dispatch_whitelist.py -q（见 README「本地测试」）。
 """
@@ -209,56 +207,6 @@ def test_douyin_gate_passes_legit_url_no_network(no_network):
     # 过闸证据：确实构造了 DouyinLiveStream 并发起 fetch（哨兵随后拦截）；
     # request_with_retry 未触达即可（首轮 fetch 失败就走不到 room_id 补全分支）。
     assert no_network[:2] == ["DouyinLiveStream()", "fetch_web_stream_data"]
-
-
-# ---------- D. api_proxy 内外代理池判定（_use_external_proxies） ----------
-
-@pytest.mark.parametrize("url,referer,want", [
-    # 海外平台域 / 流 CDN 域：走外代池
-    ("https://www.twitch.tv/xxx", "", True),
-    ("https://usher.ttvnw.net/api/channel/hls/xxx.m3u8", "", True),
-    ("https://video-weaver.ar.hls.ttvnw.net/x.ts", "", True),
-    ("https://play.sooplive.com/live/xxx.m3u8", "", True),
-    ("https://livestream-manager.sooplive.com/x", "", True),   # 旧表里的子域，后缀匹配兼容
-    ("https://nlive.pandalive.co.kr/live/xxx.m3u8", "", True),
-    ("https://live-video.net/stream/x", "", True),
-    ("https://pandalivecdn.com/live/x", "", True),
-    # 国内域：内代池
-    ("https://www.douyu.com/9999", "", False),
-    ("https://pubbilivideo.douyucdn.cn/x.flv", "", False),
-    # 【钉住修复】平台域出现在查询串/路径：旧 any(d in url) 会误切，现按主机名判定
-    ("https://www.douyu.com/api/redirect?target=https://twitch.tv", "", False),
-    ("https://hw.flv.huya.com/twitch-cdn/path.flv", "", False),
-    # referer 命中海外站 → 外代池（播放器经 api_proxy 取海外流的真实形态）
-    ("https://www.douyu.com/9999", "https://player.twitch.tv/", True),
-    ("https://www.douyu.com/9999", "https://www.pandalive.co.kr/", True),
-    # 【钉住修复】referer 里平台域只出现在路径：旧子串误判，现不切
-    ("https://www.douyu.com/9999", "https://evil.com/twitch.tv", False),
-    # referer 为空串
-    ("https://www.douyu.com/9999", "", False),
-])
-def test_use_external_proxies_matrix(url, referer, want):
-    assert main._use_external_proxies(url, referer) == want
-
-
-def test_use_external_proxies_default_referer_empty():
-    """referer 缺省值为空串（api_proxy 现调用点不传 referer 时语义不变）。"""
-    assert main._use_external_proxies("https://www.douyu.com/x") is False
-
-
-# ---------- E. m3u8 海外流判定（_is_foreign_stream 同款调用） ----------
-
-@pytest.mark.parametrize("url,want", [
-    ("https://video-weaver.xxx.hls.ttvnw.net/v/x.ts", True),
-    ("https://play.sooplive.com/live/x.m3u8", True),
-    # 【钉住修复】国内 CDN 路径里含 twitch/sooplive 字样：旧子串误判为海外流
-    # （会被改走 CF Worker + 海外 referer），现按主机名判定为国内
-    ("https://pubbilivideo.douyucdn.cn/twitch/path.flv", False),
-    ("https://hw.flv.huya.com/sooplive/path.flv", False),
-    ("https://www.douyu.com/x", False),
-])
-def test_foreign_stream_domain_check(url, want):
-    assert main._host_in(url, main.EXTERNAL_STREAM_DOMAINS) is want
 
 
 # ---------- F. 关注批量分池（FOREIGN_ROOM_DOMAINS） ----------

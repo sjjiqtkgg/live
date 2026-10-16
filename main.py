@@ -18,7 +18,7 @@ import logging
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import StreamingResponse, Response, JSONResponse
+from fastapi.responses import JSONResponse
 from urllib.parse import unquote, urlparse, quote, urljoin, urlunparse
 
 try:
@@ -117,23 +117,6 @@ async def lifespan(app):
                         M3U8_CACHE.pop(k, None)
                     logging.info(f"[缓存] M3U8_CACHE 总量超限，已从最旧清理 500 条，剩余 {len(M3U8_CACHE)} 条")
 
-                # TS 代理粘性映射：每轮主动清 10 分钟未使用的条目（活跃流会持续刷新时间戳不受影响）
-                # 而不是等总量超 500 才被动清理（E22）
-                stale_keys = [k for k, ts in list(STREAM_PROXY_MAP_TS.items()) if now - ts > 600]
-                for k in stale_keys:
-                    STREAM_PROXY_MAP.pop(k, None)
-                    STREAM_PROXY_MAP_TS.pop(k, None)
-                if len(STREAM_PROXY_MAP) > 500:
-                    now_ts = time.time()
-                    safe_to_remove = [
-                        k for k in list(STREAM_PROXY_MAP.keys())
-                        if now_ts - STREAM_PROXY_MAP_TS.get(k, 0) > 60
-                    ]
-                    for k in safe_to_remove[:250]:
-                        STREAM_PROXY_MAP.pop(k, None)
-                        STREAM_PROXY_MAP_TS.pop(k, None)
-                    logging.info(f"[缓存] STREAM_PROXY_MAP 超限，已安全清理 {len(safe_to_remove[:250])} 条，剩余 {len(STREAM_PROXY_MAP)} 条")
-
                 if len(_SOOP_OFFLINE_COUNT) > 1000:
                     keys = list(_SOOP_OFFLINE_COUNT.keys())
                     for k in keys[:500]:
@@ -197,27 +180,18 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 # ==================== 安全配置 ====================
 ALLOWED_HOSTS = [h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()]
 ALLOWED_WS_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_WS_ORIGINS", "").split(",") if o.strip()]
-MAX_TS_SIZE = int(os.getenv("MAX_TS_SIZE", str(20 * 1024 * 1024)))
-
-
-class _TsSegmentTooLarge(RuntimeError):
-    """TS 切片超过 MAX_TS_SIZE：拒绝交付截断数据，直接断开响应（见 _stream_and_close）。"""
-
 if ALLOWED_HOSTS:
     logging.info(f"[安全] Host 白名单已启用: {ALLOWED_HOSTS}")
 if ALLOWED_WS_ORIGINS:
     logging.info(f"[安全] WebSocket Origin 白名单已启用: {ALLOWED_WS_ORIGINS}")
-logging.info(f"[安全] TS 切片大小上限: {MAX_TS_SIZE} 字节")
 
 class _HostHeaderGuardMiddleware:
     """纯 ASGI Host 头守卫（替代旧 @app.middleware("http") 的 BaseHTTPMiddleware 版）。
 
-    【P1：TS 截断改断连的必要条件】BaseHTTPMiddleware 会把流式响应里的应用异常
-    吞成「干净收尾」——客户端拿到看似完整、实则截断的 body，TS 超限断连对播放器
-    的错误信号会被它整个抹掉（实测：纯 ASGI 中间件栈下断连 → RemoteProtocolError；
-    BaseHTTPMiddleware 下同样代码 → 200 + 干净收尾）。纯 ASGI 版不包装 body 流，
-    异常直达 uvicorn → transport 直接关闭 → 客户端收到网络错误（可检错、可重试）。
-    守卫语义与旧版一致：非法 Host 头 → 400 JSON。
+    【为什么纯 ASGI】BaseHTTPMiddleware 会包装 body 流并把应用异常吞成「干净收尾」
+    （实测：纯 ASGI 栈下中途异常 → transport 断开、客户端收到网络错误；BaseHTTPMiddleware
+    下同样代码 → 200 + 看似完整的收尾）。纯 ASGI 版不包装 body 流，异常直达 uvicorn，
+    保留流式与断连的真实语义。守卫语义：非法 Host 头 → 400 JSON。
     """
 
     def __init__(self, app):
@@ -308,7 +282,7 @@ if SLOWAPI_AVAILABLE:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 else:
-    logging.warning("[限流] slowapi 未安装，/api/parse 与 /api/proxy 不受限流保护")
+    logging.warning("[限流] slowapi 未安装，/api/parse 等接口不受限流保护")
     class _NoopLimiter:
         def limit(self, *args, **kwargs):
             def decorator(func):
@@ -489,8 +463,6 @@ async def get_client(proxy=None, timeout=None, verify: bool = True):
         CLIENT_POOL[key] = (client, time.time())
         return client
 
-STREAM_PROXY_MAP: dict = {}
-STREAM_PROXY_MAP_TS: dict = {}
 M3U8_CACHE: dict = {}
 _SOOP_OFFLINE_COUNT: dict = {}
 _DOUYIN_NO_STREAM_LOGGED: dict = {}
@@ -562,8 +534,8 @@ _PROXY_POOL_DEAD_SECONDS = float(os.getenv("PROXY_POOL_DEAD_SECONDS", "180"))
 
 def _proxy_pool_key(proxy_list: list) -> str:
     """冷静期分桶键：按列表成员归属判定「内池/外池/混合/纯直连」。
-    TS 粘性代理（STREAM_PROXY_MAP 固定单代理）与 get_fixed_proxy_list 轮转子集
-    都能正确归桶（子集成员 ∈ 原池即归原池）；两池配了同一个代理时归内桶（保守）。"""
+    get_fixed_proxy_list 轮转子集也能正确归桶（子集成员 ∈ 原池即归原池）；
+    两池配了同一个代理时归内桶（保守）。"""
     real = [p for p in proxy_list if p is not None]
     if not real:
         return "direct"
@@ -642,69 +614,17 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
     return await _sequential_request(method, url, targets, "[分组请求]", timeout, log_tag, **kwargs)
 
 
-async def stream_request_with_proxy_group(method, url, proxy_list, headers=None, content=None,
-                                           shuffle_proxy=False, timeout=15, log_tag=None):
-    pool_key = _proxy_pool_key(proxy_list)
-    proxies = proxy_list[:] if proxy_list else [None]
-    if shuffle_proxy and proxies:
-        random.shuffle(proxies)
-    has_real_proxy = any(p is not None for p in proxies)
-    direct_tried = proxies[0] is None
-    # 【P1二轮→T23修订】同 _sequential_request：外池直连兑底受 EXTERNAL_DIRECT_FALLBACK
-    # 控制（默认开，用户 Render 部署外代全挂时靠直连恢复海外解析；国内部署设 0）。
-    allow_direct = pool_key != "external" or EXTERNAL_DIRECT_FALLBACK
-    if has_real_proxy and allow_direct and not direct_tried and time.time() < _PROXY_POOL_DEAD_UNTIL.get(pool_key, 0.0):
-        proxies = [None] + proxies
-        direct_tried = True
-    last_error = None
-    last_index = len(proxies) - 1
-    for i, proxy in enumerate(proxies):
-        try:
-            client = await get_client(proxy, timeout, verify=_tls_verify_for(url))
-            req = client.build_request(method, url, headers=headers, content=content)
-            resp = await client.send(req, stream=True)
-            _record_proxy_health(proxy, True, tag=log_tag)
-            if log_tag:
-                logging.info(f"[{log_tag}] {_mask_proxy_url(proxy)} → HTTP {resp.status_code} {_short_url(url)}（流式）")
-            return resp
-        except Exception as e:
-            _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
-            last_error = e
-            logging.warning(_scrub_proxy_secrets(f"[流式代理]{f'[{log_tag}]' if log_tag else ''} {_mask_proxy_url(proxy)} 失败 [{type(e).__name__}]: {e}"))
-            if i != last_index:
-                await asyncio.sleep(0.5)
-    if has_real_proxy:
-        if not direct_tried and allow_direct:
-            try:
-                client = await get_client(None, timeout, verify=_tls_verify_for(url))
-                req = client.build_request(method, url, headers=headers, content=content)
-                resp = await client.send(req, stream=True)
-                _record_proxy_health(None, True, tag=log_tag)
-                # 【P1二轮：冷静期唯一设置点】同 _sequential_request：代理全挂+
-                # 直连成功才设；直连也失败/外池未尝试直连都不设。
-                _PROXY_POOL_DEAD_UNTIL[pool_key] = time.time() + _PROXY_POOL_DEAD_SECONDS
-                logging.info(f"{'[' + log_tag + '] ' if log_tag else ''}代理全部失败，直连兜底成功（流式）: {_short_url(url)}")
-                return resp
-            except Exception as e:
-                last_error = last_error or e
-                logging.warning(_scrub_proxy_secrets(f"[流式代理]{f'[{log_tag}]' if log_tag else ''} 直连兜底失败 [{type(e).__name__}]: {e}"))
-    raise last_error or Exception("所有代理均失败（流式）")
-
-
 # ==================== 平台域名白名单（P0-1：分派/分流判定统一收口） ====================
-# 【为什么】此前 main.py 里四处域名判定各自为政，且全是「子串 in url」：
+# 【为什么】此前 main.py 里域名判定各自为政，且是「子串 in url」：
 #   ① _parse_dispatch：if "douyin.com" in url —— https://douyin.com.evil.com/ 或
 #      https://evil.com/?q=douyin.com 都能混进分派，而 parse_douyin 对传入 URL 有
 #      两处裸抓取（DouyinLiveStream.fetch_web_stream_data / request_with_retry 直拉页面），
 #      任意 URL 会被后端直接 fetch —— SSRF；
-#   ② api_proxy use_external：any(d in url) —— 域名出现在路径/查询串（如
-#      /api/redirect?target=twitch.tv）也会误切外代池；
-#   ③ api_follows_batch 的 _FOREIGN_MARKERS：同款子串分池；
-#   ④ api_proxy m3u8 分流（_is_foreign_stream / eff_referer 兜底）："twitch" in url
-#      等宽子串，国内 CDN 路径里含 twitch 会被误判成海外流走 CF Worker。
+#   ② api_follows_batch 的 _FOREIGN_MARKERS：同款子串分池。
 # 统一为「urlparse 解析 hostname → 去掉 www. 前缀 → 全等/点分后缀匹配」，
-# 一张平台表 + 一组外域族表，四处共用；语义与 browse_engine.resolve_site 的
-# _DOMAIN_TO_SITE 一致（那张表挂在 browse 侧，不并表以免反向依赖）。
+# 一张平台表 + 外域族表（FOREIGN_ROOM_DOMAINS），多处共用；语义与
+# browse_engine.resolve_site 的 _DOMAIN_TO_SITE 一致（那张表挂在 browse 侧，不并表
+# 以免反向依赖）。
 # 注意：分派要求 URL 带 scheme（urlparse 对裸域名解析不出 hostname）；
 # 前端 search.vue 调 /api/parse 前已统一补 https://（parseAndGo 的 full），
 # browse 路由传入的全是 make_room_url 拼好的规范 URL，两条入口都不受影响。
@@ -719,17 +639,7 @@ PLATFORM_SITES: dict[str, str] = {
     "pandalive.co.kr": "pandatv",
 }
 
-# 外域链路（走 EXTERNAL_PROXY_URLS / CF Worker）：海外平台域 + 流 CDN 域
-EXTERNAL_STREAM_DOMAINS: tuple[str, ...] = (
-    "twitch.tv", "ttvnw.net", "twitchsvc.net",
-    "sooplive.com", "sooplive.net", "sooplivecdn.com",
-    "pandalive.co.kr", "pandalivecdn.com", "live-video.net",
-)
-# 外域 referer（referer 指向这些站说明播放器正在取海外流）
-EXTERNAL_STREAM_REFERERS: tuple[str, ...] = (
-    "twitch.tv", "player.twitch.tv", "sooplive.com", "pandalive.co.kr",
-)
-# 关注批量解析的海外/国内信号量分池（平台域级别，与 use_external 的域名族对齐）
+# 关注批量解析的海外/国内信号量分池（平台域级别）
 FOREIGN_ROOM_DOMAINS: tuple[str, ...] = ("twitch.tv", "sooplive.com", "pandalive.co.kr")
 
 
@@ -765,198 +675,6 @@ def _site_of_url(url: str) -> str:
         if _host_matches(host, domain):
             return site
     return ""
-
-
-def _use_external_proxies(url: str, referer: str = "") -> bool:
-    """api_proxy 内外代理池切换：URL 或 referer 的【主机名】命中外域族才切外代池。"""
-    return _host_in(url, EXTERNAL_STREAM_DOMAINS) or _host_in(referer, EXTERNAL_STREAM_REFERERS)
-
-
-# ------------------ 代理接口 -----------------
-@app.api_route("/api/proxy", methods=["GET", "POST"])
-@limiter.limit("60/minute")
-async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query("")):
-    # P0-7/8：Cookie 改 x-platform-cookie 头（旧 ?cookie= 查询串会落日志；
-    # 现有前端两处调用均不传 cookie，无兼容包袱）
-    cookie = request.headers.get("x-platform-cookie", "")
-    ALLOWED = [
-        ".douyu.com", ".huya.com", ".bilibili.com", ".bilivideo.com", ".douyucdn.cn",
-        ".douyin.com", ".live.bilibili.com", ".twitch.tv", ".ttvnw.net",
-        ".sooplive.com", ".sooplive.net", ".sooplivecdn.com",
-        ".pandalive.co.kr", ".live-video.net", ".pandalivecdn.com",
-    ]
-
-    def is_allowed_domain(url: str) -> bool:
-        hostname = urlparse(url).hostname
-        if not hostname:
-            return False
-        for domain in ALLOWED:
-            clean = domain.lstrip('.')
-            if hostname == clean or hostname.endswith('.' + clean):
-                return True
-        return False
-
-    if not is_allowed_domain(url):
-        raise HTTPException(403, "domain not allowed")
-
-    body = await request.body() if request.method == "POST" else None
-    headers = {"User-Agent": ua or UA, "Referer": referer or ""}
-    if cookie:
-        headers["Cookie"] = cookie
-    if request.method == "POST":
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-    # P0-1：内外代理池判定改走统一 hostname 白名单（原 any(d in url) 子串——
-    # 域名出现在路径/查询串也会误切外代池，如 /api/redirect?target=twitch.tv）
-    use_external = _use_external_proxies(url, referer)
-    proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
-    is_ts = url.lower().split("?")[0].endswith(".ts")
-
-    if is_ts:
-        stream_key = hashlib.md5(url.encode()).hexdigest()[:16]
-        if stream_key not in STREAM_PROXY_MAP:
-            if proxy_list and proxy_list[0] is not None:
-                STREAM_PROXY_MAP[stream_key] = random.choice(proxy_list)
-            else:
-                STREAM_PROXY_MAP[stream_key] = None
-            STREAM_PROXY_MAP_TS[stream_key] = time.time()
-        else:
-            STREAM_PROXY_MAP_TS[stream_key] = time.time()
-        fixed_proxy = STREAM_PROXY_MAP[stream_key]
-        proxies_to_use = [fixed_proxy] if fixed_proxy else proxy_list
-        shuffle_proxy = False
-    else:
-        proxies_to_use = proxy_list
-        shuffle_proxy = True
-
-    resp = await stream_request_with_proxy_group(
-        request.method, url,
-        proxy_list=proxies_to_use,
-        headers=headers, content=body,
-        shuffle_proxy=shuffle_proxy,
-    )
-    content_type = resp.headers.get("content-type", "")
-    is_m3u8 = "mpegurl" in content_type.lower() or url.split("?")[0].endswith(".m3u8")
-
-    if is_m3u8:
-        try:
-            await resp.aread()
-        finally:
-            await resp.aclose()
-        base_url = url.rsplit("/", 1)[0] + "/"
-        parsed_cdn = urlparse(url)
-        cdn_origin = f"{parsed_cdn.scheme}://{parsed_cdn.netloc}"
-        proxy_base = str(request.base_url).rstrip("/") + "/api/proxy"
-        # P0-1：海外流判定改 hostname 白名单（原 any(d in url) 子串——"twitch" 出现在
-        # 国内 CDN 路径里也会误判，导致国内流被改走 CF Worker + 海外 referer）
-        _is_foreign_stream = _host_in(url, EXTERNAL_STREAM_DOMAINS)
-        if CF_WORKER and _is_foreign_stream:
-            proxy_base = CF_WORKER.rstrip("/")
-        if referer:
-            eff_referer = referer
-        elif _host_in(url, ("pandalive.co.kr", "pandalivecdn.com", "live-video.net")):
-            eff_referer = "https://www.pandalive.co.kr/"
-        elif _host_in(url, ("twitch.tv", "ttvnw.net", "twitchsvc.net")):
-            eff_referer = "https://player.twitch.tv"
-        else:
-            eff_referer = "https://play.sooplive.com"
-
-        text = resp.text
-        lines = text.splitlines()
-        rewritten = []
-
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("#EXT-X-MEDIA:") or stripped.startswith("#EXT-X-MAP:") or stripped.startswith("#EXT-X-KEY:"):
-                def replace_uri(match):
-                    uri = match.group(1)
-                    # data:/skd:/urn: 等自定义 scheme（典型：内联 AES-128 key 的 data: URI）
-                    # 不能当相对路径拼进 base_url（会拼出坏地址导致解密失败），原样保留（E24）
-                    if re.match(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:', uri) and not uri.startswith(("http://", "https://")):
-                        return match.group(0)
-                    if uri.startswith("http://") or uri.startswith("https://"):
-                        abs_uri = uri
-                    elif uri.startswith("/"):
-                        abs_uri = cdn_origin + uri
-                    else:
-                        abs_uri = base_url + uri
-                    proxied = f"{proxy_base}?url={quote(abs_uri, safe='')}&referer={quote(eff_referer, safe='')}"
-                    return f'URI="{proxied}"'
-                new_line = re.sub(r'URI="([^"]+)"', replace_uri, line)
-                rewritten.append(new_line)
-                continue
-
-            if stripped and not stripped.startswith("#"):
-                if stripped.startswith("http://") or stripped.startswith("https://"):
-                    abs_url = stripped
-                elif stripped.startswith("/"):
-                    abs_url = cdn_origin + stripped
-                else:
-                    abs_url = base_url + stripped
-                proxied = f"{proxy_base}?url={quote(abs_url, safe='')}&referer={quote(eff_referer, safe='')}"
-                rewritten.append(proxied)
-            else:
-                rewritten.append(line)
-
-        body_out = "\n".join(rewritten).encode("utf-8")
-        out_headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Content-Type": "application/vnd.apple.mpegurl",
-        }
-        return Response(content=body_out, status_code=resp.status_code, headers=out_headers)
-
-    if is_ts:
-        async def _stream_and_close():
-            total = 0
-            try:
-                async for chunk in resp.aiter_bytes():
-                    total += len(chunk)
-                    if total > MAX_TS_SIZE:
-                        # P1（TS 截断改断连）：MPEG-TS 是流式容器，截断的切片对播放器
-                        # 「看起来是完整文件」——花屏/跳帧等静默劣化（数据正确性问题）。
-                        # 改为超限时直接断开响应（不发终止块），播放器收到网络错误走
-                        # 重试/切线路，不再把半截坏数据当正常切片吞下去。
-                        logging.warning(f"[代理] TS 切片超过 {MAX_TS_SIZE} 字节，断开连接拒绝交付截断数据: {_short_url(url)}")
-                        raise _TsSegmentTooLarge(f"ts segment over limit: {total} > {MAX_TS_SIZE}")
-                    yield chunk
-            finally:
-                try:
-                    await resp.aclose()
-                except Exception:
-                    pass
-
-        return StreamingResponse(
-            _stream_and_close(),
-            status_code=resp.status_code,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Content-Type": content_type or "video/mp2t"
-            }
-        )
-
-    async def _stream_and_close_fallback():
-        # 兜底分支维持截断（不学 TS 改断连）：这里的响应是 JSON/图片等，截断后客户端
-        # parse/解码会明确报错（可检错），不存在 TS 那种「看似完整实为坏数据」的静默劣化。
-        total = 0
-        truncated = False
-        try:
-            async for chunk in resp.aiter_bytes():
-                total += len(chunk)
-                if total > MAX_TS_SIZE:
-                    truncated = True
-                    logging.warning(f"[代理] 响应体超过 {MAX_TS_SIZE} 字节，提前截断: {_short_url(url)}")
-                    break
-                yield chunk
-        finally:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            if truncated:
-                logging.info(f"[代理] 兜底分支截断完成，共转发 {total} 字节")
-
-    out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": content_type or "application/json"}
-    return StreamingResponse(_stream_and_close_fallback(), status_code=resp.status_code, headers=out_headers)
 
 
 def parse_multivariant_m3u8(text, base_url, cdn_prefix):
@@ -1401,8 +1119,11 @@ async def parse_bilibili(url, cookie: str = ""):
         if room_data["data"].get("live_status") not in (1, 2):
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
 
+        # 【2026-10-16 B案】只取 AVC：codec=0,1（AVC+HEVC）会让同格式下多出一条同名的
+        # HEVC 线路（HEVC 在多数桌面浏览器 Chrome Linux/Firefox 解不了——有声音没画面）。
+        # 收窄为 codec=0；响应循环再按 codec_name 防御性过滤。
         play_resp = await request_with_retry("GET",
-            f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={real_rid}&protocol=0,1&format=0,1,2&codec=0,1&qn=10000&platform=web&ptype=8",
+            f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={real_rid}&protocol=0,1&format=0,1,2&codec=0&qn=10000&platform=web&ptype=8",
             headers=hdrs)
         play = play_resp.json()
         if play.get("code") != 0:
@@ -1412,6 +1133,9 @@ async def parse_bilibili(url, cookie: str = ""):
         for stream in playurl.get("stream", []):
             for fmt in stream.get("format", []):
                 for codec in fmt.get("codec", []):
+                    # B案防御：上游若无视 codec=0 仍回 HEVC，跳过（桌面端解不了）
+                    if str(codec.get("codec_name") or "").lower() == "hevc":
+                        continue
                     for info in codec.get("url_info", []):
                         u = info["host"] + codec["base_url"] + info["extra"]
                         if u not in seen:

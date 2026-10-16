@@ -1,7 +1,7 @@
 """P0-7/8 单测：Cookie 头化 + WS 一次性 ticket + 弹幕 WS 路径参数校验。
 
 背景（backend/main.py）：
-  - /api/parse、/api/proxy 此前 Cookie 走 ?cookie= 查询串（落反代/服务日志与浏览器历史）
+  - /api/parse 此前 Cookie 走 ?cookie= 查询串（落反代/服务日志与浏览器历史）
     → 改 x-platform-cookie 头（browse 路由 _cookie_for 同款头）；
   - /ws/soop 同样 ?cookie=（浏览器 WebSocket API 不支持自定义头）→ 新增 /api/ws-ticket
     两段式：头换 60s 单次有效 ticket（绑定 site+room_id），WS 只带 ?ticket=；

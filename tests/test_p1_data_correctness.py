@@ -1,11 +1,9 @@
-"""P1 数据正确性单测：冷静期分池 / TS 截断改断连 / B站 or 1 / strip_tags /
+"""P1 数据正确性单测：冷静期分池 / B站 or 1 / strip_tags /
 hasMore / 缓存深拷贝 / Twitch GraphQL 变量化。
 
 背景（backend/main.py + browse_platforms/*）：
   - 代理池冷静期此前是单一全局量：外代池全挂（部署环境无外网代理是常态）会误让
     国内请求也直连优先，反之亦然 → _proxy_pool_key 按池分桶；
-  - /api/proxy 的 TS 分支超限后「干净截断」：MPEG-TS 是流式容器，半截数据对播放器
-    看似完整 → 花屏/跳帧静默劣化 → 改为断连（不发终止块），播放器走重试；
   - bilibili _parse_list 的 int(get("live_status", 1) or 1)：0 是 falsy，`0 or 1` → 1
     → 未开播房间被标成开播；search 的 == 1 又与 main.py A6（1/2 同为开播）不一致
     → _live_status 统一语义；
@@ -186,50 +184,7 @@ def test_expired_cooldown_not_applied(monkeypatch):
     asyncio.run(_run())
 
 
-def test_stream_group_cooldown_pool_split(monkeypatch):
-    async def _run():
-        """流式请求同样分池：外池冷静期不影响内池流式请求先走代理。"""
-        _install_pools(monkeypatch, ["http://int-ok:1"], ["http://ext-dead:1"])
-        seen: list = []
-        _install_fake_get_client(monkeypatch, {"http://ext-dead:1"}, seen)
-
-        class _FakeStreamResp:
-            status_code = 200
-            headers = {"content-type": "video/mp2t"}
-
-            async def aiter_bytes(self):
-                yield b"x"
-
-            async def aclose(self):
-                pass
-
-        async def fake_stream(method, url, proxy_list, headers=None, content=None,
-                              shuffle_proxy=False, timeout=15, log_tag=None):
-            # 模拟「外池全挂 → 直连兜底成功」：直接走 _sequential 之外的独立路径
-            return _FakeStreamResp()
-
-        # 先让外池进入冷静期：P1二轮起外池失败不再走直连兜底/设冷静期，
-        # 这里直接置位模拟「外部冷静期已存在」的读侧场景（只验读侧隔离）
-        main._PROXY_POOL_DEAD_UNTIL["external"] = time.time() + 600
-        assert main._PROXY_POOL_DEAD_UNTIL.get("external", 0.0) > time.time()
-
-        # 内池流式请求：冷静期不串扰——第一个被 get_client 触达的是内池代理
-        seen.clear()
-        async def fake_stream_record(method, url, proxy_list, **kwargs):
-            for p in proxy_list:
-                client = await main.get_client(p, 15, verify=True)
-                await client.request(method, url)
-            return _FakeStreamResp()
-
-        monkeypatch.setattr(main, "stream_request_with_proxy_group", fake_stream_record)
-        await main.stream_request_with_proxy_group(
-            "GET", "http://example.com/b", proxy_list=["http://int-ok:1"])
-        assert seen == ["http://int-ok:1"]
-
-    asyncio.run(_run())
-
-
-# ---------- B. TS 截断改断连（活体 e2e：真实 in-process uvicorn） ----------
+# ---------- B. 活体 e2e 基建（真实 in-process uvicorn） ----------
 
 _E2E_PORT = 39904
 
@@ -251,114 +206,7 @@ def live_server():
     thread.join(timeout=5)
 
 
-class _FakeUpstreamResp:
-    """假上游流式响应：按块产出，记录是否被 aclose。"""
-
-    status_code = 200
-
-    def __init__(self, chunks):
-        self.headers = {"content-type": "video/mp2t"}
-        self._chunks = chunks
-        self.closed = False
-
-    async def aiter_bytes(self):
-        for c in self._chunks:
-            yield c
-
-    async def aclose(self):
-        self.closed = True
-
-
-def _install_ts_upstream(monkeypatch, chunks):
-    holder = {"resp": None}
-
-    async def fake_stream(method, url, proxy_list=None, headers=None, content=None,
-                          shuffle_proxy=False, timeout=15, log_tag=None, **kwargs):
-        holder["resp"] = _FakeUpstreamResp(chunks)
-        return holder["resp"]
-
-    monkeypatch.setattr(main, "stream_request_with_proxy_group", fake_stream)
-    return holder
-
-
-def test_ts_over_limit_disconnects_instead_of_truncate(live_server, monkeypatch):
-    """超限 TS：连接被断开（客户端收网络错误），不再「干净截断」交付半截数据。"""
-    monkeypatch.setattr(main, "MAX_TS_SIZE", 120)
-    chunks = [b"a" * 100, b"b" * 100, b"c" * 100]  # 总 300 > 120，第二块即超限
-    holder = _install_ts_upstream(monkeypatch, chunks)
-
-    # Accept-Encoding: identity 绕过 GZip 中间件——字节计数确定性（gzip 路径下首块
-    # 会被解压器缓冲，表面收到 0 字节；但异常断言对两种路径都成立）。
-    received = 0
-    with pytest.raises(httpx.TransportError) as ei:
-        with httpx.Client(timeout=10) as c:
-            with c.stream("GET", f"http://127.0.0.1:{_E2E_PORT}/api/proxy",
-                          params={"url": "https://hw.flv.huya.com/path/seg1.ts"},
-                          headers={"accept-encoding": "identity"}) as r:
-                for piece in r.iter_bytes():
-                    received += len(piece)
-    # 断连而非完整交付：只收到首个块（100B < 总 300B），连接被中断
-    assert received == 100
-    assert "peer closed" in str(ei.value).lower() or "incomplete" in str(ei.value).lower()
-    # 上游连接被正确关闭（finally 兜底）
-    assert holder["resp"].closed is True
-
-
-def test_ts_over_limit_disconnects_with_default_gzip_headers(live_server, monkeypatch):
-    """浏览器/hls.js 默认带 Accept-Encoding: gzip：断连信号同样到达（GZip 流式分支
-    压缩首块，httpx 解压器缓冲未吐 → 表面 0 字节，但连接中断异常照常抛出）。"""
-    monkeypatch.setattr(main, "MAX_TS_SIZE", 120)
-    chunks = [b"a" * 100, b"b" * 100]
-    _install_ts_upstream(monkeypatch, chunks)
-
-    received = 0
-    with pytest.raises(httpx.TransportError):
-        with httpx.Client(timeout=10) as c:
-            with c.stream("GET", f"http://127.0.0.1:{_E2E_PORT}/api/proxy",
-                          params={"url": "https://hw.flv.huya.com/path/seg3.ts"}) as r:
-                for piece in r.iter_bytes():
-                    received += len(piece)
-    assert received < 200  # 未完整交付
-
-
-def test_ts_under_limit_streams_normally(live_server, monkeypatch):
-    """未超限 TS：正常全量交付（修复不改变正常路径）。"""
-    monkeypatch.setattr(main, "MAX_TS_SIZE", 120)
-    chunks = [b"a" * 50, b"b" * 50]  # 总 100 ≤ 120
-    _install_ts_upstream(monkeypatch, chunks)
-
-    with httpx.Client(timeout=10) as c:
-        r = c.get(f"http://127.0.0.1:{_E2E_PORT}/api/proxy",
-                  params={"url": "https://hw.flv.huya.com/path/seg2.ts"})
-        assert r.status_code == 200
-        assert len(r.content) == 100
-
-
-def test_fallback_branch_still_truncates_cleanly(live_server, monkeypatch):
-    """非 TS 的兜底分支维持「干净截断」：JSON/图片截断后客户端可检错（parse/解码失败），
-    不存在 TS 那种「看似完整实为坏数据」的静默劣化——该差异被本用例钉住。"""
-    monkeypatch.setattr(main, "MAX_TS_SIZE", 120)
-    chunks = [b"x" * 100, b"y" * 100]
-
-    # 兜底分支的假上游需要非 TS 的 content-type
-    class _FakeJsonResp(_FakeUpstreamResp):
-        def __init__(self, chunks):
-            super().__init__(chunks)
-            self.headers = {"content-type": "application/json"}
-
-    async def fake_stream(method, url, proxy_list=None, headers=None, content=None,
-                          shuffle_proxy=False, timeout=15, log_tag=None, **kwargs):
-        return _FakeJsonResp(chunks)
-
-    monkeypatch.setattr(main, "stream_request_with_proxy_group", fake_stream)
-    with httpx.Client(timeout=10) as c:
-        r = c.get(f"http://127.0.0.1:{_E2E_PORT}/api/proxy",
-                  params={"url": "https://hw.flv.huya.com/path/data.bin"})
-        assert r.status_code == 200
-        assert len(r.content) == 100  # 截到 120 上限前的完整块，正常收尾（无异常）
-
-
-# ---------- B2. Host 守卫纯 ASGI 化回归（TS 断连的配套改造） ----------
+# ---------- B2. Host 守卫纯 ASGI 化回归 ----------
 
 def test_host_guard_rejects_invalid_host(live_server, monkeypatch):
     """守卫语义不变：非法 Host 头 → 400 JSON（从 BaseHTTPMiddleware 换成纯 ASGI 后钉住）。"""
