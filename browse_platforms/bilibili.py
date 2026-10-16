@@ -21,7 +21,6 @@ import httpx
 
 from browse_platforms.base import LivePlatform, room_dict
 from browse_platforms.common import strip_tags
-from browse_cache import LIST_CACHE
 
 log = logging.getLogger("live.bilibili")
 
@@ -65,9 +64,7 @@ class BilibiliAdapter(LivePlatform):
 
     # ---- 浏览接口 ----
     async def get_categories(self) -> list[dict[str, Any]]:
-        cached = LIST_CACHE.get("bili_cats")
-        if cached is not None:
-            return cached
+        # 【2026-10-16】分区缓存上移至 browse_api._browse_cached（统一 24h + stale-if-error）
         try:
             r = await (await self._get_client()).get(
                 API + "/room/v1/Area/getList",
@@ -84,7 +81,6 @@ class BilibiliAdapter(LivePlatform):
                         "parentId": str(item.get("id", "")),
                     })
                 cats.append({"id": str(item.get("id", "")), "name": item.get("name", ""), "pic": "", "children": children})
-            LIST_CACHE.set("bili_cats", cats, 600)
             return cats
         except Exception as e:
             log.warning(f"B站 分区失败: {e}")

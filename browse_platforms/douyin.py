@@ -251,9 +251,8 @@ class DouyinAdapter(LivePlatform):
         """照 pure_live douyin_site.getCategores：抓首页 RENDER_DATA 的 categoryData
         （from_nav=1 + 新鲜匿名 cookie，花括号配平提取），组两级分区并把父级
         自条目插为第一个 child；无图分类用 AreaPicMapper 回填其它平台图标。"""
-        cached = LIST_CACHE.get("douyin_cats")
-        if cached is not None:
-            return cached
+        # 【2026-10-16】分区缓存上移至 browse_api._browse_cached（统一 24h + stale-if-error）；
+        # 失败保持原有「转空态」语义（由缓存层判定是否回退旧数据）。
         self.cookie = await self._cookie()
         try:
             text = await self.http.get_text("https://live.douyin.com/", params={"from_nav": "1"}, headers=self._headers())
@@ -271,7 +270,6 @@ class DouyinAdapter(LivePlatform):
                     children.append({"id":f"{part.get('id_str','')},{part.get('type','')}","name":as_str(part.get("title")),"pic":"","parentId":parent_id})
                 result.append({"id":parent_id,"name":as_str(parent.get("title")),"pic":"","children":[{"id":parent_id,"name":as_str(parent.get("title")),"pic":"","parentId":parent_id},*children]})
             await self._fill_pics(result)
-            LIST_CACHE.set("douyin_cats", result, 600)
             return result
         except Exception:
             return []
@@ -301,7 +299,8 @@ class DouyinAdapter(LivePlatform):
                                 pass
                 pic_map = build_pic_map(sources)
                 if pic_map:
-                    LIST_CACHE.set("douyin_area_pic_map", pic_map, 600)
+                    # 【2026-10-16】对齐分区列表周期（24h）：该映射只在抖音分区重建时被消费
+                    LIST_CACHE.set("douyin_area_pic_map", pic_map, 24 * 3600)
             if pic_map:
                 for group in groups:
                     for sub in group.get("children", []):

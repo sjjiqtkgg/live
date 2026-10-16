@@ -22,7 +22,6 @@ from typing import Any
 
 from browse_platforms.base import LivePlatform, room_dict
 from browse_platforms.common import Http, as_str, strip_tags
-from browse_cache import LIST_CACHE
 
 log = logging.getLogger("live.twitch")
 
@@ -191,9 +190,7 @@ class TwitchAdapter(LivePlatform):
     # ---- 分类 ----
 
     async def get_categories(self) -> list[dict[str, Any]]:
-        cached = LIST_CACHE.get("twitch_cats")
-        if cached is not None:
-            return cached
+        # 【2026-10-16】分区缓存上移至 browse_api._browse_cached（统一 24h + stale-if-error）
         children = await self._helix_top_games()
         if not children:
             children = await self._gql_all_directories()
@@ -201,7 +198,6 @@ class TwitchAdapter(LivePlatform):
             return []
         root = dict(_ROOT)
         root["children"] = children
-        LIST_CACHE.set("twitch_cats", [root], 600)
         return [root]
 
     async def _helix_top_games(self) -> list[dict[str, Any]] | None:

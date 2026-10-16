@@ -17,7 +17,6 @@ from typing import Any
 
 from browse_platforms.base import LivePlatform, room_dict
 from browse_platforms.common import Http, as_str, strip_tags
-from browse_cache import LIST_CACHE
 
 SCH = "https://sch.sooplive.co.kr/api.php"
 
@@ -81,13 +80,11 @@ class SoopAdapter(LivePlatform):
     async def get_categories(self) -> list[dict[str, Any]]:
         """照 pure_live soop_site.dart getCategores：单父级「热门」，
         children 递归把 categoryList 按页拉完。"""
-        cached = LIST_CACHE.get("soop_cats")
-        if cached is not None:
-            return cached
+        # 【2026-10-16】分区缓存上移至 browse_api._browse_cached（统一 24h + stale-if-error）；
+        # 失败保持原有「转空态」语义（由缓存层判定是否回退旧数据）。
         try:
             categories: list[dict[str, Any]] = [{"id": "1", "name": "热门", "pic": "", "children": []}]
             categories[0]["children"] = await self._get_all_sub_categories("1", 1, 120, [])
-            LIST_CACHE.set("soop_cats", categories, 600)
             return categories
         except Exception:
             return []

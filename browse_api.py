@@ -1,6 +1,7 @@
 """Browse APIs registered on the existing uploaded main.py FastAPI app."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any, Awaitable, Callable
@@ -9,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from urllib.parse import quote, urlparse
 
 from browse_platforms import make_room_url, registry
+from browse_cache import BROWSE_CACHE
 
 log = logging.getLogger("live.browse")
 router = APIRouter(prefix="/api")
@@ -184,11 +186,70 @@ async def _parse_main(url: str, cookie: str, site: str, room_id: str) -> dict[st
     return normalize_parse(await _parser(url, cookie), site, room_id)
 
 
+# ==================== 浏览缓存（stale-if-error，2026-10-16） ====================
+# 三个浏览列表接口统一走 BROWSE_CACHE：软 TTL 到期照常抓新；上游失败（基类守卫把
+# 异常转成空态）时回退「上次成功数据」（硬保留 24h）。分区 24h / 推荐 3min / 分区房间 5min。
+# - 新平台零改动：适配器注册进 registry 即自动享受本层（key/TTL 与平台无关）；
+# - 单平台/单接口要单独调 TTL：往 _BROWSE_TTL_OVERRIDE 加 ("site","method"): 秒数（预留扩展点）；
+# - 缓存存「适配器原始结果」，图片包 Worker 代理在本层外做——换 Worker 地址不吃陈旧数据；
+# - 搜索不缓存（关键词空间无界 + 主动行为要新鲜）；详情/取流走各自既有缓存。
+_BROWSE_TTL: dict[str, float] = {
+    "getCategories": 24 * 3600,
+    "getRecommendRooms": 180,
+    "getCategoryRooms": 300,
+}
+_BROWSE_TTL_OVERRIDE: dict[tuple[str, str], float] = {}  # 预留：(site, method) → 覆盖秒数
+
+
+def _browse_ttl(site: str, method: str) -> float:
+    return _BROWSE_TTL_OVERRIDE.get((site, method), _BROWSE_TTL[method])
+
+
+def _browse_key(site: str, method: str, params: tuple, cookie: str) -> str:
+    # cookie 短指纹入 key：登录前后/换号后不吃串味缓存（分区虽基本与 cookie 无关，一并统一）
+    fp = hashlib.sha1(cookie.encode("utf-8", "ignore")).hexdigest()[:8] if cookie else "-"
+    return f"{method}:{site}:{fp}:" + "|".join(str(p) for p in params)
+
+
+def _browse_empty(method: str, result: Any) -> bool:
+    """空态判失败：基类守卫把适配器异常统一转成空态（cats=[] / 列表 {list:[]}），
+    空态与「真失败」在本层不可区分——对列表接口，翻到末页的空页也会走这里，
+    但没有对应 key 的旧值可退，行为与现状一致（返回空页）。"""
+    if method == "getCategories":
+        return not result
+    return not (isinstance(result, dict) and result.get("list"))
+
+
+async def _browse_cached(site: str, method: str, params: tuple, cookie: str,
+                         factory: Callable[[], Awaitable[Any]]) -> Any:
+    key = _browse_key(site, method, params, cookie)
+    hit = BROWSE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        result = await factory()
+    except Exception as e:  # 基类守卫之外的兜底（测试替身/未来改动），保持异常可观测
+        stale = BROWSE_CACHE.get_stale(key)
+        if stale is None:
+            raise
+        log.warning(f"[缓存] {key} 上游异常（{type(e).__name__}），回退上次成功数据（stale-if-error）")
+        return stale
+    if _browse_empty(method, result):
+        stale = BROWSE_CACHE.get_stale(key)
+        if stale is not None:
+            log.warning(f"[缓存] {key} 上游返回空态，回退上次成功数据（stale-if-error）")
+            return stale
+        return result
+    BROWSE_CACHE.set(key, result, _browse_ttl(site, method))
+    return result
+
+
 @router.get("/{site}/getCategories")
 async def get_categories(site: str, request: Request):
-    adapter = _adapter(site, _cookie_for(site, request))
+    cookie = _cookie_for(site, request)
+    adapter = _adapter(site, cookie)
     try:
-        categories = await adapter.get_categories()
+        categories = await _browse_cached(site, "getCategories", (), cookie, adapter.get_categories)
         # 分类图（Twitch 游戏封面等海外 CDN 图）同样包 Worker 代理
         for cat in categories if isinstance(categories, list) else []:
             if isinstance(cat, dict):
@@ -203,9 +264,12 @@ async def get_categories(site: str, request: Request):
 
 @router.get("/{site}/getCategoryRooms")
 async def get_category_rooms(site: str, request: Request, parentAreaId: str = Query(""), areaId: str = Query(""), page: int = Query(1, ge=1), pageSize: int = Query(24, ge=1, le=100)):
-    adapter = _adapter(site, _cookie_for(site, request))
+    cookie = _cookie_for(site, request)
+    adapter = _adapter(site, cookie)
     try:
-        result = await adapter.get_category_rooms(parentAreaId, areaId, page, pageSize)
+        result = await _browse_cached(
+            site, "getCategoryRooms", (parentAreaId, areaId, page, pageSize),
+            cookie, lambda: adapter.get_category_rooms(parentAreaId, areaId, page, pageSize))
         rows = result.get("list", [])
         return {"site": site, **result, "list": [_room(item, site) for item in rows if isinstance(item, dict)]}
     finally:
@@ -214,9 +278,12 @@ async def get_category_rooms(site: str, request: Request, parentAreaId: str = Qu
 
 @router.get("/{site}/getRecommendRooms")
 async def get_recommend_rooms(site: str, request: Request, page: int = Query(1, ge=1), pageSize: int = Query(24, ge=1, le=100)):
-    adapter = _adapter(site, _cookie_for(site, request))
+    cookie = _cookie_for(site, request)
+    adapter = _adapter(site, cookie)
     try:
-        result = await adapter.get_recommend_rooms(page, pageSize)
+        result = await _browse_cached(
+            site, "getRecommendRooms", (page, pageSize),
+            cookie, lambda: adapter.get_recommend_rooms(page, pageSize))
         rows = result.get("list", [])
         return {"site": site, **result, "list": [_room(item, site) for item in rows if isinstance(item, dict)]}
     finally:

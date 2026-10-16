@@ -8,7 +8,6 @@ import re
 from typing import Any
 from browse_platforms.base import LivePlatform, room_dict
 from browse_platforms.common import Http, as_str, strip_tags
-from browse_cache import LIST_CACHE
 
 UA = "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36 Edg/117.0.0.0"
 # 照 pure_live HuyaRequestParams.hysdkUa：普通浏览器 UA 现在只能拿到 JS 壳页面，
@@ -23,9 +22,8 @@ class HuyaAdapter(LivePlatform):
         self.http = Http(extra_headers={"user-agent": UA, "referer": "https://www.huya.com/", "origin": "https://www.huya.com", **({"cookie": cookie} if cookie else {})})
 
     async def get_categories(self) -> list[dict[str, Any]]:
-        cached = LIST_CACHE.get("huya_cats")
-        if cached is not None:
-            return cached
+        # 【2026-10-16】分区缓存上移至 browse_api._browse_cached（统一 24h + stale-if-error）；
+        # 本方法保持「只抓取」职责，单组失败仍只缺该组（分组容错不变）。
         cats = []
         for raw_id, title in [("1", "网游"), ("2", "单机"), ("8", "娱乐"), ("3", "手游")]:
             # 单个分组失败只缺该组（pure_live getAllSubCategores 同样容错），
@@ -49,8 +47,6 @@ class HuyaAdapter(LivePlatform):
                 if gid and name:
                     children.append({"id": gid, "name": name, "pic": f"https://huyaimg.msstatic.com/cdnimage/game/{gid}-MS.jpg", "parentId": raw_id})
             cats.append({"id": raw_id, "name": title, "pic": "", "children": children})
-        if cats:
-            LIST_CACHE.set("huya_cats", cats, 600)
         return cats
 
     async def get_category_rooms(self, parent_area_id: str, area_id: str, page: int, page_size: int) -> dict[str, Any]:
