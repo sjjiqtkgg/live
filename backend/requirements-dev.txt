@@ -1,7 +1,0 @@
-# 开发 / CI 依赖（不进生产镜像，见 Dockerfile 只装 requirements.txt）
-# 用途（见仓库 README「测试与 CI」一节）：
-#   - pyflakes：静态检查（能抓未定义名——历史上 log 未定义的问题本可被它拦下）
-#   - pytest：backend/tests 单测运行器
-# 版本与 CI（.github/workflows/ci.yml backend job）保持一致，本地复现 = CI 结果。
-pyflakes==4.0.3
-pytest==9.0.2
