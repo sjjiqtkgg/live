@@ -87,6 +87,18 @@ def test_max_items_evicts_soonest_hard():
     assert c.get("b") == 2 and c.get("c") == 3
 
 
+def test_set_grace_override_per_entry():
+    """set(grace=...) 可按条目覆盖兜底期（browse_api 房间列表 30min / 分区 24h 就靠它）"""
+    c = StaleTTLCache(grace=1000.0)
+    t = [0.0]
+    c._now = lambda: t[0]  # type: ignore[method-assign]
+    c.set("short", 1, 10, grace=50)
+    c.set("long", 2, 10)
+    t[0] = 10 + 50 + 1
+    assert c.get_stale("short") is None   # 短兜底期已硬过期
+    assert c.get_stale("long") == 2       # 未覆盖的仍按默认 grace
+
+
 # ---------- B. _browse_cached 包装（stale-if-error） ----------
 
 def test_cached_hit_skips_factory(monkeypatch: pytest.MonkeyPatch):
@@ -193,6 +205,38 @@ def test_cookie_fingerprint_isolates_keys(monkeypatch: pytest.MonkeyPatch):
     asyncio.run(browse_api._browse_cached("zzt", "getRecommendRooms", (1, 24), "a=2", factory))
     asyncio.run(browse_api._browse_cached("zzt", "getRecommendRooms", (1, 24), "a=1", factory))
     assert calls["n"] == 2             # 不同 cookie 分键；同 cookie 命中
+
+
+@pytest.mark.parametrize("method,soft", [("getRecommendRooms", 180), ("getCategoryRooms", 300)])
+def test_room_list_grace_capped_30min(monkeypatch: pytest.MonkeyPatch, method: str, soft: int):
+    """房间列表（推荐/分区房间）兜底期=30 分钟：期内回退旧值，超出后不再回退（2026-10-17 用户拍板）"""
+    mode = {"empty": False}
+
+    async def factory():
+        return EMPTY_LIST if mode["empty"] else SAMPLE_LIST
+
+    _, clock = _fresh_cache(monkeypatch)
+    asyncio.run(browse_api._browse_cached("zzt", method, (1, 24), "", factory))
+    mode["empty"] = True
+    clock["t"] += soft + 29 * 60       # 软过期 + 29 分钟：仍在 30 分钟兜底期内
+    assert asyncio.run(browse_api._browse_cached("zzt", method, (1, 24), "", factory)) == SAMPLE_LIST
+    clock["t"] += 2 * 60               # 累计超过 30 分钟兜底期
+    assert asyncio.run(browse_api._browse_cached("zzt", method, (1, 24), "", factory)) == EMPTY_LIST
+
+
+def test_cats_grace_still_24h(monkeypatch: pytest.MonkeyPatch):
+    """分区列表兜底期保持 24h（软 24h 过期 1 小时后，上游空态仍回退旧值）"""
+    mode = {"empty": False}
+    cats = [{"id": "1", "name": "网游", "pic": "", "children": []}]
+
+    async def factory():
+        return [] if mode["empty"] else cats
+
+    _, clock = _fresh_cache(monkeypatch)
+    asyncio.run(browse_api._browse_cached("zzt", "getCategories", (), "", factory))
+    mode["empty"] = True
+    clock["t"] += 86400 + 3600
+    assert asyncio.run(browse_api._browse_cached("zzt", "getCategories", (), "", factory)) == cats
 
 
 # ---------- C. 全链路（路由 → 缓存；命中不触适配器方法） ----------

@@ -115,7 +115,8 @@ class StaleTTLCache:
                 return None
             return copy.deepcopy(value)
 
-    def set(self, key: str, value: Any, ttl: float | None = None) -> None:
+    def set(self, key: str, value: Any, ttl: float | None = None,
+            grace: float | None = None) -> None:
         now = self._now()
         soft = now + (ttl if ttl is not None else self._ttl)
         with self._lock:
@@ -130,7 +131,8 @@ class StaleTTLCache:
                     self._store.pop(oldest, None)
                 except ValueError:
                     pass
-            self._store[key] = (soft, soft + self._grace, value)
+            # grace 可按条目覆盖（browse_api 对房间列表用 30 分钟、分区列表 24h）
+            self._store[key] = (soft, soft + (grace if grace is not None else self._grace), value)
 
     def sweep(self) -> int:
         """清掉全部硬过期条目（测试/手动可调；常规由 set() 周期触发）。"""

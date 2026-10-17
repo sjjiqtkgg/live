@@ -186,9 +186,11 @@ async def _parse_main(url: str, cookie: str, site: str, room_id: str) -> dict[st
     return normalize_parse(await _parser(url, cookie), site, room_id)
 
 
-# ==================== 浏览缓存（stale-if-error，2026-10-16） ====================
+# ==================== 浏览缓存（stale-if-error） ====================
 # 三个浏览列表接口统一走 BROWSE_CACHE：软 TTL 到期照常抓新；上游失败（基类守卫把
-# 异常转成空态）时回退「上次成功数据」（硬保留 24h）。分区 24h / 推荐 3min / 分区房间 5min。
+# 异常转成空态）时回退「上次成功数据」。软：分区 24h / 推荐 3min / 分区房间 5min；
+# 硬保留（软+兜底）：分区 24h；**房间列表（推荐/分区房间）30 分钟**——直播房间时效性
+# 强，过久的旧列表大半已下播，兜底价值低于误导性（2026-10-17 用户拍板）。
 # - 新平台零改动：适配器注册进 registry 即自动享受本层（key/TTL 与平台无关）；
 # - 单平台/单接口要单独调 TTL：往 _BROWSE_TTL_OVERRIDE 加 ("site","method"): 秒数（预留扩展点）；
 # - 缓存存「适配器原始结果」，图片包 Worker 代理在本层外做——换 Worker 地址不吃陈旧数据；
@@ -197,6 +199,11 @@ _BROWSE_TTL: dict[str, float] = {
     "getCategories": 24 * 3600,
     "getRecommendRooms": 180,
     "getCategoryRooms": 300,
+}
+_BROWSE_GRACE: dict[str, float] = {
+    "getCategories": 24 * 3600,    # 分区列表：静态数据，兜底期保持 24h
+    "getRecommendRooms": 30 * 60,  # 主页推荐：兜底 30 分钟
+    "getCategoryRooms": 30 * 60,   # 分区房间：兜底 30 分钟
 }
 _BROWSE_TTL_OVERRIDE: dict[tuple[str, str], float] = {}  # 预留：(site, method) → 覆盖秒数
 
@@ -240,7 +247,7 @@ async def _browse_cached(site: str, method: str, params: tuple, cookie: str,
             log.warning(f"[缓存] {key} 上游返回空态，回退上次成功数据（stale-if-error）")
             return stale
         return result
-    BROWSE_CACHE.set(key, result, _browse_ttl(site, method))
+    BROWSE_CACHE.set(key, result, _browse_ttl(site, method), grace=_BROWSE_GRACE[method])
     return result
 
 
