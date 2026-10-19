@@ -4,6 +4,7 @@ Source project: https://github.com/liuchuancong/pure_live (AGPL-3.0).
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import re
 from typing import Any
 from browse_platforms.base import LivePlatform, room_dict
@@ -13,6 +14,19 @@ UA = "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like G
 # 照 pure_live HuyaRequestParams.hysdkUa：普通浏览器 UA 现在只能拿到 JS 壳页面，
 # HYSDK UA 才会返回含 TT_ROOM_DATA / stream: 数据块的完整房间页
 HYSDK_UA = "HYSDK(Windows,30000002)_APP(pc_exe&7100004&official)_SDK(trans&2.40.0.6448)"
+_HUYA_CATEGORY_GROUPS = (("1", "网游"), ("2", "单机"), ("8", "娱乐"), ("3", "手游"))
+_HUYA_CATEGORY_URL = "https://live.cdn.huya.com/liveconfig/game/bussLive"
+log = logging.getLogger("live.browse")
+
+
+class HuyaCategories(list[dict[str, Any]]):
+    """列表兼容的虎牙分类结果，附带抓取完整性元数据。"""
+
+    def __init__(self, values=(), *, complete: bool = True, failed_groups=()):
+        super().__init__(values)
+        self.complete = complete
+        self.failed_groups = tuple(str(group) for group in failed_groups)
+
 
 class HuyaAdapter(LivePlatform):
     site = "huya"
@@ -22,18 +36,34 @@ class HuyaAdapter(LivePlatform):
         self.http = Http(extra_headers={"user-agent": UA, "referer": "https://www.huya.com/", "origin": "https://www.huya.com", **({"cookie": cookie} if cookie else {})})
 
     async def get_categories(self) -> list[dict[str, Any]]:
-        # 【2026-10-16】分区缓存上移至 browse_api._browse_cached（统一 24h + stale-if-error）；
-        # 本方法保持「只抓取」职责，单组失败仍只缺该组（分组容错不变）。
-        cats = []
-        for raw_id, title in [("1", "网游"), ("2", "单机"), ("8", "娱乐"), ("3", "手游")]:
-            # 单个分组失败只缺该组（pure_live getAllSubCategores 同样容错），
-            # 不能像以前那样一个子请求异常就让整个分区接口 500
-            try:
-                data = await self.http.get_json("https://live.cdn.huya.com/liveconfig/game/bussLive", params={"bussType": raw_id}, headers={"user-agent": UA})
-            except Exception:
+        # 【2026-10-19】四个顶级分组必须全部抓到，单组失败最多重试一次；
+        # 返回仍保持 list 形状，完整性由 HuyaCategories 元数据 + browse_api 校验。
+        cats = HuyaCategories()
+        failed_groups = []
+        for raw_id, title in _HUYA_CATEGORY_GROUPS:
+            data = None
+            last_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    data = await self.http.get_json(
+                        _HUYA_CATEGORY_URL,
+                        params={"bussType": raw_id},
+                        headers={"user-agent": UA},
+                    )
+                    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                        raise ValueError("分类响应缺少 data 数组")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt == 0:
+                        log.warning("huya get_categories 分组 %s 首次请求失败，准备重试 [%s]: %s", raw_id, type(exc).__name__, exc)
+            if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                failed_groups.append(raw_id)
+                log.warning("huya get_categories 分组 %s 重试后仍失败 [%s]: %s", raw_id, type(last_error).__name__ if last_error else "InvalidResponse", last_error or "invalid response")
                 continue
+
             children = []
-            for item in data.get("data", []) if isinstance(data, dict) else []:
+            for item in data["data"]:
                 if not isinstance(item, dict):
                     continue
                 raw_gid = item.get("gid", "")
@@ -47,6 +77,9 @@ class HuyaAdapter(LivePlatform):
                 if gid and name:
                     children.append({"id": gid, "name": name, "pic": f"https://huyaimg.msstatic.com/cdnimage/game/{gid}-MS.jpg", "parentId": raw_id})
             cats.append({"id": raw_id, "name": title, "pic": "", "children": children})
+
+        cats.complete = not failed_groups
+        cats.failed_groups = tuple(failed_groups)
         return cats
 
     async def get_category_rooms(self, parent_area_id: str, area_id: str, page: int, page_size: int) -> dict[str, Any]:
