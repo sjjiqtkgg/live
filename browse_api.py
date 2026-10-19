@@ -215,7 +215,31 @@ def _browse_ttl(site: str, method: str) -> float:
 def _browse_key(site: str, method: str, params: tuple, cookie: str) -> str:
     # cookie 短指纹入 key：登录前后/换号后不吃串味缓存（分区虽基本与 cookie 无关，一并统一）
     fp = hashlib.sha1(cookie.encode("utf-8", "ignore")).hexdigest()[:8] if cookie else "-"
-    return f"{method}:{site}:{fp}:" + "|".join(str(p) for p in params)
+    # 虎牙分类完整性策略上线后切换版本，避免旧进程里已有的部分分类继续命中。
+    version = ":v2" if site.lower() == "huya" and method == "getCategories" else ""
+    return f"{method}:{site}:{fp}{version}:" + "|".join(str(p) for p in params)
+
+
+def _browse_categories_valid(site: str, result: Any) -> bool:
+    """虎牙四个顶级分类必须齐全；其它平台沿用各自原有契约。"""
+    if site.lower() != "huya":
+        return True
+    from browse_platforms.huya import _HUYA_CATEGORY_GROUPS
+
+    if not isinstance(result, list) or not getattr(result, "complete", True):
+        return False
+    if getattr(result, "failed_groups", ()):
+        return False
+    ids = {str(category.get("id", "")) for category in result if isinstance(category, dict)}
+    return {group_id for group_id, _ in _HUYA_CATEGORY_GROUPS}.issubset(ids)
+
+
+def _browse_result_valid(site: str, method: str, result: Any) -> bool:
+    if method == "getCategories":
+        if site.lower() == "huya":
+            return bool(result) and _browse_categories_valid(site, result)
+        return not _browse_empty(method, result)
+    return not _browse_empty(method, result)
 
 
 def _browse_empty(method: str, result: Any) -> bool:
@@ -232,20 +256,35 @@ async def _browse_cached(site: str, method: str, params: tuple, cookie: str,
     key = _browse_key(site, method, params, cookie)
     hit = BROWSE_CACHE.get(key)
     if hit is not None:
-        return hit
+        if _browse_result_valid(site, method, hit):
+            return hit
+        log.warning("[缓存] %s fresh 分类缓存不完整，丢弃并重新抓取", key)
     try:
         result = await factory()
     except Exception as e:  # 基类守卫之外的兜底（测试替身/未来改动），保持异常可观测
         stale = BROWSE_CACHE.get_stale(key)
-        if stale is None:
-            raise
-        log.warning(f"[缓存] {key} 上游异常（{type(e).__name__}），回退上次成功数据（stale-if-error）")
-        return stale
-    if _browse_empty(method, result):
-        stale = BROWSE_CACHE.get_stale(key)
-        if stale is not None:
-            log.warning(f"[缓存] {key} 上游返回空态，回退上次成功数据（stale-if-error）")
+        if stale is not None and _browse_result_valid(site, method, stale):
+            log.warning(f"[缓存] {key} 上游异常（{type(e).__name__}），回退上次成功数据（stale-if-error）")
             return stale
+        if stale is not None:
+            log.warning("[缓存] %s stale 分类缓存不完整，拒绝回退", key)
+        if site.lower() == "huya" and method == "getCategories":
+            log.warning("[缓存] %s 虎牙分类上游异常且无完整缓存，返回空目录", key)
+            return []
+        raise
+    if not _browse_result_valid(site, method, result):
+        stale = BROWSE_CACHE.get_stale(key)
+        if stale is not None and _browse_result_valid(site, method, stale):
+            log.warning("[缓存] %s 上游分类不完整，回退完整旧数据（stale-if-error）", key)
+            return stale
+        if site.lower() == "huya" and method == "getCategories":
+            failed_groups = getattr(result, "failed_groups", ())
+            detail = ",".join(failed_groups) if failed_groups else "unknown"
+            log.warning("[缓存] %s 虎牙分类不完整（缺少分组 %s），不缓存", key, detail)
+            # 列表契约下返回空态，避免把不完整目录显示成正常结果。
+            return []
+        if stale is not None:
+            log.warning("[缓存] %s stale 分类缓存不完整，拒绝回退", key)
         return result
     BROWSE_CACHE.set(key, result, _browse_ttl(site, method), grace=_BROWSE_GRACE[method])
     return result
