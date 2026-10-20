@@ -1,17 +1,18 @@
 #!/bin/bash
-# entrypoint.sh —— 双进程监督器（P3 批重写：Go 服务独立重启）
+# entrypoint.sh —— 双进程监督器（加入 FastAPI 就绪探测，防平台端口探测错乱）
 #
 # 旧版行为：`wait -n` —— uvicorn 或 douyinLive（Go 抖音弹幕，:1088）任一退出，
 # 整个容器跟着退出，依赖平台（Render / docker --restart）把两个进程一起重启。
 # 副作用：Go 弹幕服务崩溃会连坐 FastAPI（所有在途请求与弹幕 WS 连接全断），
 # 反之亦然——一个组件的故障半径被放大成整个服务栈的故障。
 #
-# 新版行为（本批）：
+# 新版行为：
+#   0. **就绪探测（新增）**：先启动 FastAPI，用 curl 死等其就绪，确认后再拉起 Go 服务。
+#      防止 Orkestr 等平台在启动瞬间探测到 Go 服务（1088）而误判主端口。
 #   1. 独立重启：哪个进程退出只重启哪个（带指数退避 1s→30s 封顶，
 #      稳定运行满 60s 退避重置），另一个进程与其连接完全不受影响；
 #   2. 信号转发：容器 stop（SIGTERM/SIGINT）→ 先 TERM 两个子进程、
 #      宽限 8s 等 uvicorn 优雅排空（WS 连接/在途请求），残留强杀后干净退出。
-#      bash 默认不向后台子进程转发信号，旧版 stop 时子进程直接变孤儿。
 #
 # 依赖：`wait -n -p VAR` 需要 bash >= 5.1（python:3.12-slim 基于 Debian
 # bookworm，bash 5.2，满足）；zombie 子进程由 bash 在 wait 时自动回收。
@@ -52,25 +53,42 @@ STABLE_SECONDS=60
 FASTAPI_BACKOFF=$BACKOFF_MIN
 GO_BACKOFF=$BACKOFF_MIN
 
+# ================== 启动阶段：先起 FastAPI，再起 Go ==================
 start_fastapi
+
+# 阻塞等待，直到 FastAPI 成功在 $APP_PORT 上响应
+echo "[supervisor] waiting for FastAPI to be ready on :${APP_PORT}..."
+MAX_RETRIES=30
+RETRY_COUNT=0
+while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SHUTDOWN" -eq 0 ]; do
+  # 使用 curl 探测，返回状态码不是 000 即认为网络层已通（哪怕返回 404/403 也算服务活了）
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${APP_PORT}/" || echo "000")
+  if [ "$HTTP_CODE" != "000" ]; then
+    echo "[supervisor] FastAPI is ready! (HTTP $HTTP_CODE)"
+    break
+  fi
+  sleep 1
+  RETRY_COUNT=$((RETRY_COUNT + 1))
+done
+
+if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+  echo "[supervisor] WARNING: FastAPI did not become ready in 30s, starting Go anyway..."
+fi
+
+# 确认 FastAPI 起来后，再启动 Go 弹幕服务
 start_douyinlive
+# ====================================================================
 
 # ---- 主监督循环：任一退出只重启该进程 ----
 while :; do
   EXITED_PID=""
-  # wait -n -p：子进程退出（或停机信号打断 wait）时返回；
-  # 信号打断会先执行 term_children 再让 wait 返回非零，|| true 吞掉非零
   wait -n -p EXITED_PID || true
   [ "$SHUTDOWN" -eq 1 ] && break
-  # 信号打断且无子进程退出时 EXITED_PID 为空：直接回循环顶
-  # （SHUTDOWN 已置位则 break；绝不能假定 FastAPI 死了去重启——否则停机时
-  #  会凭空多拉一个收不到 TERM 的新进程，宽限循环陪等满 8 秒）
   [ -z "$EXITED_PID" ] && continue
 
   if [ "$EXITED_PID" = "$FASTAPI_PID" ]; then
     RC=0; wait "$FASTAPI_PID" 2>/dev/null; RC=$?
     echo "[supervisor] FastAPI exited (rc=${RC})"
-    # 稳定运行满 STABLE_SECONDS 则退避重置，避免长命服务偶发崩溃被长退避拖慢
     [ $((SECONDS - FASTAPI_STARTED)) -ge "$STABLE_SECONDS" ] && FASTAPI_BACKOFF=$BACKOFF_MIN
     echo "[supervisor] restarting FastAPI in ${FASTAPI_BACKOFF}s"
     sleep "$FASTAPI_BACKOFF"
@@ -90,7 +108,6 @@ while :; do
 done
 
 # ---- 收尾：宽限 8s 等子进程自行退出（uvicorn 优雅排空 WS/请求），残留强杀 ----
-# 注意：kill 目标不能是空串兜底的 0（PID 0 = 整个进程组，会误杀监督器自身）
 is_alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
 echo "[supervisor] waiting up to 8s for children to exit..."
 for _ in $(seq 1 8); do
