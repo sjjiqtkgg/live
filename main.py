@@ -21,6 +21,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from urllib.parse import unquote, urlparse, quote, urljoin, urlunparse
 
+from browse_cache import BROWSE_CACHE
+
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
@@ -111,6 +113,19 @@ async def lifespan(app):
                     M3U8_CACHE.pop(k, None)
                 if expired:
                     logging.info(f"[缓存] 清理 {len(expired)} 条过期条目，剩余 {len(M3U8_CACHE)} 条")
+
+                # 【内存占用】浏览缓存原先只在下一次写入时顺带 sweep；空闲时硬过期
+                # 条目会一直占位（有 300 键上限，不会增长）。这里每 60s 主动回收一次。
+                try:
+                    BROWSE_CACHE.sweep()
+                except Exception:
+                    logging.exception("[缓存] BROWSE_CACHE sweep 异常（已吞并继续）")
+
+                # WS ticket 只有 60s TTL；签发时已顺带扫，这里周期补扫，空闲时也不残留。
+                try:
+                    _sweep_ws_tickets()
+                except Exception:
+                    pass
                 if len(M3U8_CACHE) > 2000:
                     # 总量兜底：dict 保插入序，从最旧条目开始删（近似 LRU），防长期运行内存膨胀（E22）
                     for k in list(M3U8_CACHE.keys())[:500]:

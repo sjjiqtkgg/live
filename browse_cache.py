@@ -151,5 +151,7 @@ class StaleTTLCache:
 
 
 # 浏览三接口专用（browse_api 统一包装）：软 TTL 分区 24h / 推荐 3min / 分区房间 5min，
-# 硬过期 = 软 + 24h 保留（stale-if-error 兜底窗口）；上限 500 键（≈ 15~25MB 封顶）。
-BROWSE_CACHE = StaleTTLCache(default_ttl=180.0, max_items=500)
+# 硬过期 = 软 + 24h 保留（stale-if-error 兜底窗口）。
+# 上限 300 键：房间列表单页可达 100~250KB，500 键在实际翻页场景可能常驻数十 MB；
+# 300 键仍足够覆盖常用分区/页码，同时给 1GB 容器留出余量。
+BROWSE_CACHE = StaleTTLCache(default_ttl=180.0, max_items=300)

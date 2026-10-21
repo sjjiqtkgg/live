@@ -1,6 +1,7 @@
 """Browse APIs registered on the existing uploaded main.py FastAPI app."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import os
@@ -286,7 +287,11 @@ async def _browse_cached(site: str, method: str, params: tuple, cookie: str,
         if stale is not None:
             log.warning("[缓存] %s stale 分类缓存不完整，拒绝回退", key)
         return result
-    BROWSE_CACHE.set(key, result, _browse_ttl(site, method), grace=_BROWSE_GRACE[method])
+    # 【缓存污染修复】getCategories 路由拿到返回值后会原地改写 cat["pic"]（包 Worker
+    # 代理）；若缓存存的是同一对象，缓存里的原始数据会被污染，违背“缓存存适配器原始
+    # 结果、图片分流在缓存外做”的契约。分类结果只在写入时拷贝一次，读取仍走深拷贝。
+    cached = copy.deepcopy(result) if method == "getCategories" else result
+    BROWSE_CACHE.set(key, cached, _browse_ttl(site, method), grace=_BROWSE_GRACE[method])
     return result
 
 
