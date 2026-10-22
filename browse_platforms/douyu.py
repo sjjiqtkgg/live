@@ -73,8 +73,21 @@ class DouyuAdapter(LivePlatform):
         return {"list": rooms, "hasMore": len(rooms) > 0}
 
     def _room(self, x: dict[str, Any]) -> dict[str, Any]:
-        av = as_str(x.get("av", ""))
-        return room_dict(roomId=as_str(x.get("rid", "")), title=as_str(x.get("rn", "")), nickname=as_str(x.get("nn", "")), avatar=f"https://apic.douyucdn.cn/upload/{av}_middle.jpg" if av else "", cover=as_str(x.get("rs16", "")), area=as_str(x.get("c2name", "")), watching=as_str(x.get("ol", "")), isLive=True, platform=self.site)
+        av = as_str(x.get("av", "")).strip()
+        # 【头像 404 修复】斗鱼部分接口的 av 已经是完整 URL（https://apic.douyucdn.cn/
+        # upload/..._middle.jpg），旧实现无条件再拼一次 /upload/ 和 _middle.jpg，生成
+        # “upload/https://...” 的双重前缀，实测 404 → 关注/房间列表头像裂图。
+        if av.startswith("http://") or av.startswith("https://"):
+            avatar = av
+        elif av.startswith("//"):
+            avatar = "https:" + av
+        elif av:
+            avatar = f"https://apic.douyucdn.cn/upload/{av}"
+            if not avatar.endswith("_middle.jpg"):
+                avatar += "_middle.jpg"
+        else:
+            avatar = ""
+        return room_dict(roomId=as_str(x.get("rid", "")), title=as_str(x.get("rn", "")), nickname=as_str(x.get("nn", "")), avatar=avatar, cover=as_str(x.get("rs16", "")), area=as_str(x.get("c2name", "")), watching=as_str(x.get("ol", "")), isLive=True, platform=self.site)
 
     async def get_room_detail(self, room_id: str) -> dict[str, Any] | None:
         d = await self.http.get_json(f"https://www.douyu.com/betard/{room_id}", params={}, headers={"referer": f"https://www.douyu.com/{room_id}", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"})

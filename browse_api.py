@@ -101,8 +101,19 @@ def _is_foreign_img_host(hostname: str) -> bool:
 
 def _wrap_image_url(url: str) -> str:
     """海外平台封面/头像走 CF Worker /avatar 代理；未配置 CF_WORKER_URL 时保持直连。"""
-    if not url or not url.startswith("http"):
+    if not url:
         return url
+    # 【全平台地址归一】部分平台（B站/斗鱼/SOOP 等）会返回协议相对地址 //host/x.jpg。
+    # 先补 https: 变成绝对地址，后面的 http 升级与海外域名判定才能生效。
+    if url.startswith("//"):
+        url = "https:" + url
+    if not url.startswith("http"):
+        return url
+    # 【混合内容修复】https 页面加载 http 图片会被浏览器拦截（虎牙头像实测仍是
+    # http://huyaimg.msstatic.com/...）。所有图片统一先升级到 https——国内图床
+    # 普遍支持 https，升级失败也会走前端 v-lazy 的降级链。
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
     worker = os.getenv("CF_WORKER_URL", "").strip().rstrip("/")
     if not worker or url.startswith(worker):
         return url
@@ -111,8 +122,6 @@ def _wrap_image_url(url: str) -> str:
     except ValueError:
         return url
     if _is_foreign_img_host(hostname):
-        if url.startswith("http://"):
-            url = "https://" + url[len("http://"):]
         return f"{worker}/avatar?url={quote(url, safe='')}"
     return url
 
